@@ -1,0 +1,62 @@
+#!/usr/sbin/nft -f
+#
+# OnionOverVPN client kill-switch, loaded in the client container's own network
+# namespace. TEMPLATE: the at-sign placeholders below are filled in by
+# entrypoint.sh from the environment and the client config, so no address is
+# hardcoded in this project. (Don't write a placeholder-shaped token in a comment:
+# the entrypoint greps this file for leftovers and would flag it.)
+#
+# The point: the default route is wg0, but a route can disappear — the tunnel
+# drops, the interface is reconfigured, something adds a route. If that happens
+# the kernel would happily fall back to eth0 and send traffic to the clear
+# internet. These rules make that impossible: the ONLY thing allowed to leave
+# over anything other than wg0 is the encrypted WireGuard tunnel itself.
+#
+# So when the tunnel is down, nothing goes out at all. That is the intended
+# behaviour, not a malfunction.
+#
+# Note on syntax: nftables requires `comment` to be the final token of a rule.
+
+destroy table inet onionvpn_client
+
+table inet onionvpn_client {
+	chain output {
+		type filter hook output priority filter; policy drop;
+
+		# Docker's embedded resolver answers from the HOST's resolver, which is
+		# exactly the leak this setup exists to prevent. entrypoint.sh already
+		# rewrites resolv.conf; this makes anything that ignores resolv.conf
+		# fail closed instead of resolving outside Tor.
+		ip daddr @DOCKER_DNS@ counter drop comment "DROPPED docker dns resolves on the host"
+
+		oifname "lo" accept
+		oifname "wg0" accept comment "inside the tunnel: fine"
+
+		# Replies on connections the input chain already accepted — i.e. the
+		# SOCKS5 relay. Without this the relay accepts a connection and then
+		# cannot answer it, which looks exactly like a broken proxy.
+		# This opens no new outbound flows: only answers to accepted ones.
+		ct state established,related accept comment "answer accepted connections"
+
+		# The encrypted tunnel to the server, and nothing else, may start a new
+		# conversation over eth0.
+		ip daddr @ENDPOINT_IP@ udp dport @ENDPOINT_PORT@ counter accept comment "wireguard"
+
+		counter drop comment "DROPPED would have bypassed the tunnel"
+	}
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iifname "lo" accept
+		ct state established,related accept
+		tcp dport @SOCKS_PORT@ counter accept comment "socks5 relay clients"
+
+		counter drop comment "DROPPED unsolicited inbound"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		counter comment "DROPPED this container routes nothing"
+	}
+}

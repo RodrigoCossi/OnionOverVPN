@@ -1,0 +1,6 @@
+# Private keys and deployment settings. Nothing in here should ever be
+# committed: config/ holds the server private key and every peer's preshared
+# key, clients/ holds each client's private key.
+.env
+config/
+clients/

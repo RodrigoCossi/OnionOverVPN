@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# OnionOverVPN — host-side control for the WireGuard + Tor stack.
+#
+#   onionvpn init            generate server keys and configs (run once)
+#   onionvpn up              build if needed, then start the stack
+#   onionvpn down            stop the stack
+#   onionvpn restart         restart both containers
+#   onionvpn status          tunnel, peers, Tor bootstrap, drop counters
+#   onionvpn test            full end-to-end verification through the tunnel
+#   onionvpn exit-ip         the address the internet currently sees
+#   onionvpn newnym          force new circuits, i.e. a different exit address
+#   onionvpn add <name>      add a client, write its .conf and QR code
+#   onionvpn remove <name>   revoke a client
+#   onionvpn list            list clients
+#   onionvpn show <name>     print a client config
+#   onionvpn qr <name>       print a client config as a QR code
+#   onionvpn logs [svc]      follow container logs
+#   onionvpn uninstall       remove containers, images and the Tor cache
+#
+# Keys never leave this directory. config/ and clients/ are mode 700 and hold
+# private keys in mode 600 files.
+set -euo pipefail
+
+PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+CONFIG_DIR="$PROJECT_DIR/config"
+PEERS_DIR="$CONFIG_DIR/peers"
+CLIENTS_DIR="$PROJECT_DIR/clients"
+ENV_FILE="$PROJECT_DIR/.env"
+EXAMPLE_FILE="$PROJECT_DIR/.env.example"
+SERVER_CT=onionvpn-server
+CLIENT_CT=onionvpn-client
+
+# Fixed inside the container, and deliberately not configurable: it is the port
+# the server's own wg0 and nftables rules agree on, never exposed as-is. The
+# port reachable from the internet is WG_PORT in .env, published onto this one.
+WG_CONTAINER_PORT=51820
+
+if [[ -t 1 ]]; then
+    B=$(printf '\033[1m'); DIM=$(printf '\033[2m'); R=$(printf '\033[0m')
+    GRN=$(printf '\033[32m'); RED=$(printf '\033[31m'); YLW=$(printf '\033[33m')
+else
+    B=''; DIM=''; R=''; GRN=''; RED=''; YLW=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+head2() { printf '\n%s%s%s\n' "$B" "$*" "$R"; }
+warn() { printf '%s!%s %s\n' "$YLW" "$R" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
+
+compose() { ( cd "$PROJECT_DIR" && docker compose "$@" ); }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+load_env() {
+    [[ -f $ENV_FILE ]] || die "no .env — run '$0 init' first"
+    set -a; . "$ENV_FILE"; set +a
+}
+
+# --------------------------------------------------------------------------
+# init
+# --------------------------------------------------------------------------
+detect_public_ip() {
+    local ip
+    for url in https://ifconfig.me https://api.ipify.org https://icanhazip.com; do
+        ip=$(curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]') || continue
+        [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { printf '%s' "$ip"; return 0; }
+    done
+    return 1
+}
+
+cmd_init() {
+    need wg; need docker; need curl
+    install -d -m 700 "$CONFIG_DIR" "$PEERS_DIR" "$CLIENTS_DIR"
+
+    # .env is built from .env.example rather than from values embedded here, so
+    # every default has exactly one home and this script holds no addresses.
+    if [[ ! -f $ENV_FILE ]]; then
+        [[ -f $EXAMPLE_FILE ]] || die "missing .env.example — it holds every default this project uses"
+        local pub
+        pub=$(detect_public_ip) \
+            || die "could not detect this host's public IPv4 — copy .env.example to .env and set PUBLIC_IP by hand"
+        sed "s|^PUBLIC_IP=.*|PUBLIC_IP=$pub|" "$EXAMPLE_FILE" > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        grep -q "^PUBLIC_IP=$pub\$" "$ENV_FILE" || die "could not write PUBLIC_IP into .env"
+        say "wrote .env from .env.example (public address detected: $pub)"
+    else
+        say "keeping existing .env"
+    fi
+    load_env
+
+    # Fail now rather than at container start if a required value is absent.
+    local missing=()
+    local key
+    for key in PUBLIC_IP WG_PORT WG_SERVER_IP WG_PREFIX WG_MTU SOCKS_PORT DOCKER_EMBEDDED_DNS; do
+        [[ -n ${!key:-} ]] || missing+=("$key")
+    done
+    (( ${#missing[@]} == 0 )) || die ".env is missing: ${missing[*]} (compare it with .env.example)"
+
+    if [[ ! -f $CONFIG_DIR/server.key ]]; then
+        ( umask 077; wg genkey > "$CONFIG_DIR/server.key" )
+        wg pubkey < "$CONFIG_DIR/server.key" > "$CONFIG_DIR/server.pub"
+        chmod 600 "$CONFIG_DIR/server.key"; chmod 644 "$CONFIG_DIR/server.pub"
+        say "generated server keypair"
+    else
+        say "keeping existing server keypair"
+    fi
+
+    # The co-located container client, used by 'onionvpn test'. Its endpoint is
+    # the server's container name, so it needs no published port and keeps
+    # working if the host's public IP changes.
+    [[ -d $CLIENTS_DIR/docker ]] || add_client docker "$SERVER_CT:$WG_CONTAINER_PORT"
+
+    render_server_conf
+    say ""
+    say "initialised. next: ${B}onionvpn up${R}, then ${B}onionvpn test${R}"
+}
+
+# --------------------------------------------------------------------------
+# peers
+# --------------------------------------------------------------------------
+next_free_ip() {
+    local base=${WG_SERVER_IP%.*} host
+    for host in $(seq 2 254); do
+        grep -qxF "$base.$host" "$PEERS_DIR"/*/ip 2>/dev/null || { printf '%s.%s' "$base" "$host"; return 0; }
+    done
+    die "no free address left in $base.0/$WG_PREFIX"
+}
+
+add_client() {
+    local name=$1 endpoint=${2:-}
+    [[ $name =~ ^[a-zA-Z0-9_-]+$ ]] || die "client name may only contain letters, digits, '-' and '_'"
+    [[ -d $PEERS_DIR/$name ]] && die "client '$name' already exists (remove it first)"
+    [[ -n $endpoint ]] || endpoint="$PUBLIC_IP:$WG_PORT"
+
+    local ip; ip=$(next_free_ip)
+    install -d -m 700 "$PEERS_DIR/$name" "$CLIENTS_DIR/$name"
+
+    local priv pub psk
+    priv=$(wg genkey); pub=$(printf '%s' "$priv" | wg pubkey); psk=$(wg genpsk)
+
+    printf '%s\n' "$pub" > "$PEERS_DIR/$name/public.key"
+    printf '%s\n' "$psk" > "$PEERS_DIR/$name/preshared.key"
+    printf '%s\n' "$ip"  > "$PEERS_DIR/$name/ip"
+    chmod 600 "$PEERS_DIR/$name/preshared.key"
+
+    local conf="$CLIENTS_DIR/$name/$name.conf"
+    ( umask 077; cat > "$conf" <<EOF
+# OnionOverVPN client "$name"
+#
+# Import this into any WireGuard app. Once connected, every TCP connection and
+# every DNS lookup from this device is onion-routed; anything Tor cannot carry
+# (UDP, QUIC, ICMP) is dropped rather than sent over the clear internet.
+[Interface]
+PrivateKey = $priv
+Address = $ip/32
+# Tor's DNSPort, reached through the tunnel. Without this line lookups would go
+# to your local resolver and defeat the whole arrangement.
+DNS = $WG_SERVER_IP
+MTU = $WG_MTU
+
+[Peer]
+PublicKey = $(cat "$CONFIG_DIR/server.pub")
+PresharedKey = $psk
+Endpoint = $endpoint
+# Full tunnel. ::/0 is included on purpose: it pulls IPv6 into the tunnel where
+# it is dropped, instead of leaving it to escape over the local connection.
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+    )
+    command -v qrencode >/dev/null 2>&1 && qrencode -t png -o "$CLIENTS_DIR/$name/$name.png" -r "$conf"
+    say "client ${B}$name${R}: $ip, endpoint $endpoint"
+    say "  config  $conf"
+    [[ -f $CLIENTS_DIR/$name/$name.png ]] && say "  QR code $CLIENTS_DIR/$name/$name.png"
+    return 0
+}
+
+render_server_conf() {
+    local out="$CONFIG_DIR/wg0.conf" tmp
+    tmp=$(mktemp "$CONFIG_DIR/.wg0.XXXXXX")
+    {
+        cat <<EOF
+# Generated by 'onionvpn add/remove' — edit the peers, not this file.
+[Interface]
+PrivateKey = $(cat "$CONFIG_DIR/server.key")
+ListenPort = $WG_CONTAINER_PORT
+EOF
+        local dir name
+        for dir in "$PEERS_DIR"/*/; do
+            [[ -d $dir ]] || continue
+            name=$(basename "$dir")
+            cat <<EOF
+
+# $name
+[Peer]
+PublicKey = $(cat "$dir/public.key")
+PresharedKey = $(cat "$dir/preshared.key")
+AllowedIPs = $(cat "$dir/ip")/32
+EOF
+        done
+    } > "$tmp"
+    chmod 600 "$tmp"; mv "$tmp" "$out"
+}
+
+reload_server() {
+    if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CT" 2>/dev/null) == true ]]; then
+        docker exec "$SERVER_CT" /usr/local/bin/reload.sh
+    fi
+}
+
+cmd_add() {
+    load_env
+    [[ $# -ge 1 ]] || die "usage: onionvpn add <name>"
+    add_client "$1"
+    render_server_conf
+    reload_server
+}
+
+cmd_remove() {
+    load_env
+    [[ $# -ge 1 ]] || die "usage: onionvpn remove <name>"
+    local name=$1
+    [[ -d $PEERS_DIR/$name ]] || die "no such client: $name"
+    [[ $name == docker ]] && warn "'docker' is the client used by 'onionvpn test'"
+    # Keep the key material instead of shredding it blind: it moves aside, so a
+    # mistaken revoke is recoverable until the user clears the directory.
+    local stash="$CLIENTS_DIR/.revoked/$name-$(date +%Y%m%d%H%M%S)"
+    install -d -m 700 "$(dirname "$stash")"
+    mv "$PEERS_DIR/$name" "$stash.peer"
+    [[ -d $CLIENTS_DIR/$name ]] && mv "$CLIENTS_DIR/$name" "$stash.client"
+    render_server_conf
+    reload_server
+    say "revoked ${B}$name${R}; its keys were moved to $stash.* (delete that to make it permanent)"
+}
+
+cmd_list() {
+    load_env
+    local dir name ip key hs ep handshakes endpoints
+    # Fetch both tables once rather than exec'ing per peer.
+    handshakes=$(docker exec "$SERVER_CT" wg show wg0 latest-handshakes 2>/dev/null) || handshakes=""
+    endpoints=$(docker exec "$SERVER_CT" wg show wg0 endpoints 2>/dev/null) || endpoints=""
+
+    printf '%-14s %-12s %-15s %s\n' NAME ADDRESS "LAST HANDSHAKE" "SEEN COMING FROM"
+    for dir in "$PEERS_DIR"/*/; do
+        [[ -d $dir ]] || continue
+        name=$(basename "$dir"); ip=$(cat "$dir/ip"); key=$(cat "$dir/public.key")
+
+        hs=$(printf '%s\n' "$handshakes" | awk -v k="$key" '$1==k{print $2}')
+        if [[ -n ${hs:-} && ${hs:-0} -gt 0 ]]; then
+            hs="$(( $(date +%s) - hs ))s ago"
+        else
+            hs="never"
+        fi
+
+        # The source address the server actually received packets from. This is
+        # what a provider firewall that filters by source IP is matching on, so
+        # it is the one value worth seeing when a client cannot connect.
+        ep=$(printf '%s\n' "$endpoints" | awk -v k="$key" '$1==k{print $2}')
+        [[ -n ${ep:-} && $ep != "(none)" ]] || ep="-"
+
+        printf '%-14s %-12s %-15s %s\n' "$name" "$ip" "$hs" "$ep"
+    done
+}
+
+cmd_show() { [[ $# -ge 1 ]] || die "usage: onionvpn show <name>"; cat "$CLIENTS_DIR/$1/$1.conf"; }
+
+cmd_qr() {
+    need qrencode
+    [[ $# -ge 1 ]] || die "usage: onionvpn qr <name>"
+    [[ -f $CLIENTS_DIR/$1/$1.conf ]] || die "no such client: $1"
+    qrencode -t ansiutf8 -r "$CLIENTS_DIR/$1/$1.conf"
+    say "scan with the WireGuard app on your phone"
+}
+
+# --------------------------------------------------------------------------
+# lifecycle
+# --------------------------------------------------------------------------
+cmd_up() {
+    load_env
+    [[ -f $CONFIG_DIR/wg0.conf ]] || die "run 'onionvpn init' first"
+    compose up -d --build
+    say ""
+    say "waiting for Tor to bootstrap (first run takes 30-60s)..."
+    local i
+    for i in $(seq 1 60); do
+        if [[ $(docker inspect -f '{{.State.Health.Status}}' "$SERVER_CT" 2>/dev/null) == healthy ]]; then
+            say "${GRN}server healthy${R} after ${i}0s"
+            break
+        fi
+        sleep 10
+    done
+    cmd_status
+}
+
+cmd_down()    { compose down; }
+cmd_restart() { compose restart; }
+cmd_build()   { compose build "$@"; }
+cmd_logs()    { compose logs -f --tail=80 "$@"; }
+
+cmd_status() {
+    load_env
+    head2 "containers"
+    compose ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+
+    if [[ $(docker inspect -f '{{.State.Running}}' "$SERVER_CT" 2>/dev/null) != true ]]; then
+        warn "server container is not running — 'onionvpn up'"
+        return 0
+    fi
+
+    head2 "tunnel"
+    docker exec "$SERVER_CT" wg show wg0 2>/dev/null | sed 's/^/  /' || warn "wg0 not up"
+
+    head2 "tor"
+    docker exec "$SERVER_CT" sh -c \
+        'grep -oE "Bootstrapped [0-9]+%.*" /run/tor/notices.log 2>/dev/null | tail -n1' \
+        | sed 's/^/  /' || warn "no bootstrap line yet"
+
+    head2 "policy counters (server)"
+    # A rule reads "counter packets N bytes M <verdict> comment "...""; the
+    # verdict in the middle is why this is parsed positionally rather than with
+    # one regex. Anything on a DROPPED line is traffic that was stopped from
+    # leaving over the clear internet.
+    docker exec "$SERVER_CT" nft list table inet onionvpn 2>/dev/null \
+        | awk '/counter packets/ && /comment "/ {
+                 match($0, /counter packets [0-9]+ bytes [0-9]+/)
+                 split(substr($0, RSTART, RLENGTH), n, " ")
+                 match($0, /comment "[^"]+"/)
+                 label = substr($0, RSTART + 9, RLENGTH - 10)
+                 printf "  %-34s %10s pkts %12s bytes\n", label, n[3], n[5]
+               }' \
+        || warn "ruleset not loaded"
+
+    head2 "socks5 proxy"
+    if curl -fsS --max-time 25 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+            https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        say "  ${GRN}127.0.0.1:$SOCKS_PORT works and exits through Tor${R}"
+    else
+        say "  ${DIM}127.0.0.1:$SOCKS_PORT not answering through Tor yet${R}"
+    fi
+    say ""
+}
+
+# The address the internet sees. It is a Tor exit relay, never this host, and it
+# is not stable: Tor rotates circuits (every 10 minutes by default) and uses
+# different circuits for different destinations.
+cmd_exit_ip() {
+    load_env
+    local api exit_ip
+    api=$(curl -fsS --max-time 45 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+          https://check.torproject.org/api/ip 2>/dev/null) \
+        || die "no answer through 127.0.0.1:$SOCKS_PORT — is the stack up? ('onionvpn status')"
+    exit_ip=$(printf '%s' "$api" | sed -n 's/.*"IP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    if printf '%s' "$api" | grep -q '"IsTor":true'; then
+        say "exit relay:   ${B}${exit_ip}${R}  ${DIM}(what the internet sees)${R}"
+        say "this host:    $PUBLIC_IP  ${DIM}(what nobody downstream sees)${R}"
+        say ""
+        say "${DIM}The exit address changes on its own every few minutes, and differs per"
+        say "destination. 'onionvpn newnym' forces a change now.${R}"
+    else
+        die "that request did NOT go through Tor (seen as ${exit_ip:-unknown})"
+    fi
+}
+
+cmd_newnym() {
+    load_env
+    docker exec "$SERVER_CT" /usr/local/bin/newnym.sh
+}
+
+cmd_test() {
+    load_env
+    [[ $(docker inspect -f '{{.State.Running}}' "$CLIENT_CT" 2>/dev/null) == true ]] \
+        || die "client container is not running — 'onionvpn up'"
+    docker exec -e REAL_IP="$PUBLIC_IP" "$CLIENT_CT" /usr/local/bin/verify.sh
+}
+
+cmd_uninstall() {
+    say "This removes the containers, both images and Tor's cached consensus."
+    say "Keys in config/ and clients/ are kept."
+    read -r -p "Type 'yes' to continue: " answer
+    [[ $answer == yes ]] || { say "cancelled"; return 0; }
+    compose down -v --rmi local
+    say "removed. 'onionvpn up' rebuilds from the same keys."
+}
+
+# --------------------------------------------------------------------------
+# Print the comment block at the top of this file, so the help text and the
+# documentation cannot drift apart. Robust against the block changing length.
+usage() {
+    awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+    init)      cmd_init "$@" ;;
+    up|start)  cmd_up "$@" ;;
+    down|stop) cmd_down "$@" ;;
+    restart)   cmd_restart "$@" ;;
+    build)     cmd_build "$@" ;;
+    status)    cmd_status "$@" ;;
+    test|verify) cmd_test "$@" ;;
+    exit-ip|ip)  cmd_exit_ip "$@" ;;
+    newnym|rotate) cmd_newnym "$@" ;;
+    add)       cmd_add "$@" ;;
+    remove|revoke) cmd_remove "$@" ;;
+    list|ls)   cmd_list "$@" ;;
+    show)      cmd_show "$@" ;;
+    qr)        cmd_qr "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help|-h|--help) usage ;;
+    *)         die "unknown command '$cmd' (try: onionvpn help)" ;;
+esac

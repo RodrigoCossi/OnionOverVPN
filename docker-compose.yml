@@ -1,0 +1,88 @@
+# OnionOverVPN — WireGuard in front of onion routing.
+#
+#   your device --[ WireGuard, UDP ]--> server container --[ Tor circuits ]--> internet
+#
+# The two services are deliberately separate containers with separate network
+# namespaces: the server's redirect-everything-into-Tor policy and the client's
+# kill-switch are opposite rulesets and must not share a namespace.
+#
+# The client service here is the co-located reference client and verifier. A
+# client on another machine uses docker-compose.client.yml, or just one of the
+# generated .conf files with any ordinary WireGuard app.
+name: onionvpn
+
+services:
+  server:
+    build: ./server
+    image: onionvpn-server:local
+    container_name: onionvpn-server
+    hostname: onionvpn-server
+    # Needed to create wg0 and load nftables rules in its own namespace.
+    # It grants nothing on the host: the namespace is separate.
+    cap_add: [NET_ADMIN]
+    sysctls:
+      # Second leak guard, behind the nftables forward chain: with forwarding
+      # off the kernel itself will not move a packet from wg0 to the internet.
+      net.ipv4.ip_forward: "0"
+    environment:
+      # No defaults on purpose: every address lives in .env, and a default here
+      # could silently disagree with the one the host CLI wrote into the client
+      # configs. The entrypoint fails loudly on a missing value instead.
+      WG_SERVER_IP: ${WG_SERVER_IP:?set in .env — run bin/onionvpn init}
+      WG_PREFIX: ${WG_PREFIX:?set in .env}
+      WG_MTU: ${WG_MTU:?set in .env}
+    ports:
+      # The one port that must be reachable from the internet.
+      - "${WG_PORT:?set in .env}:51820/udp"
+    volumes:
+      - ./config:/config:ro
+      - tor-data:/var/lib/tor
+    tmpfs:
+      # Keeps Tor's notices log out of the writable layer, so `docker restart`
+      # cannot leave a stale "Bootstrapped 100%" for the healthcheck to find.
+      - /run
+    networks: [onionvpn]
+    restart: unless-stopped
+
+  client:
+    build: ./client
+    image: onionvpn-client:local
+    container_name: onionvpn-client
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    environment:
+      SOCKS_PORT: ${SOCKS_PORT:?set in .env}
+      DOCKER_EMBEDDED_DNS: ${DOCKER_EMBEDDED_DNS:?set in .env}
+      # Lets the verifier assert that the exit address is not the server's own.
+      REAL_IP: ${PUBLIC_IP:-}
+      # Verification targets, so verify.sh hardcodes no address or URL.
+      LEAK_PROBE_ADDR: ${LEAK_PROBE_ADDR:-}
+      TOR_CHECK_URL: ${TOR_CHECK_URL:-}
+      ONION_CHECK_URL: ${ONION_CHECK_URL:-}
+    volumes:
+      - ./clients/docker/docker.conf:/config/client.conf:ro
+    ports:
+      # SOCKS5 into Tor, over the tunnel. Bound to loopback: this is for apps on
+      # this host, not for the internet.
+      - "127.0.0.1:${SOCKS_PORT:?set in .env}:${SOCKS_PORT:?set in .env}"
+    networks: [onionvpn]
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # Tor's cached consensus. Persisting it turns a 30-60s bootstrap into a
+  # few seconds on restart.
+  tor-data:
+
+networks:
+  onionvpn:
+    name: onionvpn
+    ipam:
+      config:
+        # Pinned rather than auto-assigned, so it cannot collide with other
+        # Docker networks already on the host. Set it in .env; list the ranges
+        # your host already uses with `docker network ls` + `inspect` first.
+        - subnet: ${DOCKER_NET_SUBNET:?set in .env}

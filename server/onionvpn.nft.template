@@ -1,0 +1,88 @@
+#!/usr/sbin/nft -f
+#
+# OnionOverVPN — server packet policy. TEMPLATE: @WG_SERVER_IP@ is substituted by
+# entrypoint.sh from the environment, so no address is hardcoded here. Set it in
+# .env, not in this file.
+#
+# This ruleset is loaded inside the server CONTAINER's own network namespace,
+# so it is completely separate from the host's firewall and from Docker's
+# iptables-nft tables. Nothing here can affect the host.
+#
+# For packets arriving on wg0 (the VPN clients):
+#   port 53 (udp/tcp) -> Tor DNSPort     resolved inside Tor, so no DNS leak
+#   any other TCP     -> Tor TransPort   onion-routed transparently
+#   ICMP to @WG_SERVER_IP@ -> allowed, so a client can ping its own gateway
+#   anything else      -> DROP
+#
+# That last line is the leak protection, and it has no exceptions. Onion
+# routing carries TCP only: there is no way to send UDP (QUIC, WireGuard,
+# game traffic, VoIP) or ICMP through a Tor circuit. A packet Tor cannot carry
+# must die here rather than quietly go out over the clear internet instead.
+#
+# On eth0 (the Docker bridge) only the WireGuard handshake is accepted inbound;
+# Tor's own outbound circuits are covered by the conntrack rule.
+#
+# Note on syntax: nftables requires `comment` to be the final token of a rule,
+# after the verdict.
+
+destroy table inet onionvpn
+
+table inet onionvpn {
+	# ------------------------------------------------------------------
+	# Redirect client traffic into the local Tor daemon.
+	# ------------------------------------------------------------------
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+
+		iifname != "wg0" return
+
+		# DNS first: more specific than the two rules below.
+		udp dport 53 counter redirect to :5353 comment "dns -> tor"
+		tcp dport 53 counter redirect to :5353 comment "dns/tcp -> tor"
+
+		# Traffic aimed at the gateway itself must NOT be redirected, or the
+		# catch-all below would silently swallow connections to Tor's own SOCKS
+		# port and send them to the transparent port instead. Which is exactly
+		# what happened the first time this was tested.
+		ip daddr @WG_SERVER_IP@ counter return comment "gateway's own listeners"
+
+		# Everything else Tor can actually carry.
+		meta l4proto tcp counter redirect to :9040 comment "tcp -> tor"
+	}
+
+	# ------------------------------------------------------------------
+	# What may talk to the server itself.
+	# ------------------------------------------------------------------
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iifname "lo" accept
+		ct state established,related accept
+
+		# The WireGuard handshake, arriving on the Docker bridge.
+		udp dport 51820 counter accept comment "wireguard handshake"
+
+		# Redirected client traffic, now addressed to the Tor listeners.
+		iifname "wg0" tcp dport 9040 counter accept comment "tor transport"
+		iifname "wg0" udp dport 5353 counter accept comment "tor dnsport"
+		iifname "wg0" tcp dport 5353 counter accept comment "tor dnsport/tcp"
+		iifname "wg0" tcp dport 9050 counter accept comment "tor socks"
+		iifname "wg0" ip protocol icmp counter accept comment "ping the gateway"
+
+		# No other service on this container is reachable from the tunnel.
+		counter drop comment "DROPPED client -> server"
+	}
+
+	# ------------------------------------------------------------------
+	# Nothing is ever routed. Traffic Tor can carry was already redirected
+	# above; traffic it cannot carry must die here rather than leak.
+	# ------------------------------------------------------------------
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		counter comment "DROPPED no clearnet route"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}

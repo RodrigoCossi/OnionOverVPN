@@ -1,0 +1,58 @@
+# OnionOverVPN — Tor configuration for the server container. TEMPLATE:
+# @WG_SERVER_IP@ is substituted by entrypoint.sh from the environment, so this
+# project holds no tunnel address in its code. Set it in .env, not here.
+#
+# This is the onion-routing daemon only. No browser, no GUI: it builds Tor
+# circuits and exposes them as a transparent proxy, a DNS resolver and a SOCKS5
+# port, all bound to the WireGuard address @WG_SERVER_IP@.
+#
+# Nothing listens on the container's bridge interface, so this box can never be
+# used as an open proxy from the internet.
+
+# Transparent proxy for the TCP that nftables redirects here.
+# IsolateClientAddr gives each VPN client its own circuits; IsolateClientProtocol
+# keeps DNS streams off the circuits used for TCP. For stronger unlinkability add
+# IsolateDestAddr IsolateDestPort, at a real cost in speed (a new circuit per
+# destination).
+TransPort @WG_SERVER_IP@:9040 IsolateClientAddr IsolateClientProtocol
+
+# DNS resolved inside Tor. Client configs point DNS= at @WG_SERVER_IP@:53, which the
+# nftables rules redirect here. This is what keeps lookups off the clear net.
+DNSPort @WG_SERVER_IP@:5353
+
+# Direct SOCKS5, for apps that can proxy themselves rather than be redirected
+# transparently. Always preferable when the app supports it: the app hands Tor a
+# hostname instead of resolving it first. The client container re-exposes this
+# port on the host as a ready-to-use SOCKS5 proxy.
+SocksPort @WG_SERVER_IP@:9050 IsolateClientAddr IsolateClientProtocol
+
+# Make .onion addresses work over the tunnel: a lookup returns a virtual IP from
+# this range and Tor maps it back to the hidden service on connect. This range is
+# Tor's own documented default, not a setting of ours — but it must not overlap
+# the tunnel subnet, so check it if you move the tunnel into 10.192.0.0/10.
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+AutomapHostsSuffixes .onion,.exit
+
+# The tunnel is IPv4-only (client IPv6 is captured by the tunnel and dropped),
+# so don't return AAAA answers no client can reach.
+ClientUseIPv4 1
+ClientUseIPv6 0
+
+# Control port for `onionvpn newnym`, which asks Tor for fresh circuits so new
+# connections leave from a different exit relay. Bound to the container's
+# loopback, so it is reachable only via `docker exec` — never from the tunnel
+# and never from the network. Cookie auth means there is no password to manage.
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+
+# Persisted on a named volume, so a restart reuses the cached consensus and
+# bootstraps in seconds instead of minutes.
+DataDirectory /var/lib/tor
+
+# stdout goes to `docker logs`. The file is what the healthcheck greps for
+# "Bootstrapped 100%", and it lives on tmpfs on purpose: a persisted log would
+# still show a stale success from the previous run.
+Log notice stdout
+Log notice file /run/tor/notices.log
+SafeLogging 1

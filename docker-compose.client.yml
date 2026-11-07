@@ -1,0 +1,59 @@
+# OnionOverVPN — client only, for a machine that is NOT the server.
+#
+# This is the split you want in normal use: the server runs on the remote host,
+# this runs on your own machine. Copy just these files over:
+#
+#   docker-compose.client.yml
+#   client/            (the whole directory)
+#   your-client.conf   (generated on the server with 'onionvpn add <name>')
+#
+# then:
+#
+#   cp .env.example .env     # so the verification checks have their targets
+#   CLIENT_CONF=./your-client.conf docker compose -f docker-compose.client.yml up -d --build
+#   docker exec onionvpn-client /usr/local/bin/verify.sh
+#
+# Without a .env beside this file, verify.sh skips the ICMP-leak and circuit checks
+# and says so rather than reporting a false pass.
+#
+# The config already contains the server's public address, so there is nothing
+# else to point at. Two ways to use the tunnel from here:
+#
+#   * SOCKS5 on 127.0.0.1:1080 — point a browser or curl at it. Nothing else on
+#     the machine is affected. This is the recommended way.
+#   * put another container behind it with:
+#         network_mode: "service:client"
+#     and all of that container's traffic is onion-routed.
+#
+# What this does NOT do is change your machine's own routing. That is
+# deliberate: a container cannot safely seize the host's default route, and the
+# SOCKS port gives you the same path with none of the risk. To route the whole
+# machine, import the same .conf into the normal WireGuard app instead.
+name: onionvpn-client
+
+services:
+  client:
+    build: ./client
+    image: onionvpn-client:local
+    container_name: onionvpn-client
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    environment:
+      SOCKS_PORT: ${SOCKS_PORT:-1080}
+      # Docker's own fixed resolver address, blocked by the kill-switch because it
+      # answers from the host. Override only if Docker changes it.
+      DOCKER_EMBEDDED_DNS: ${DOCKER_EMBEDDED_DNS:-127.0.0.11}
+      # Optional: set to the server's public address and verify.sh will also assert
+      # that the exit address is not the server's own.
+      REAL_IP: ${REAL_IP:-}
+      # Verification targets. Copy these from .env.example if you want the full
+      # check suite; without them verify.sh skips those checks and says so.
+      LEAK_PROBE_ADDR: ${LEAK_PROBE_ADDR:-}
+      TOR_CHECK_URL: ${TOR_CHECK_URL:-}
+      ONION_CHECK_URL: ${ONION_CHECK_URL:-}
+    volumes:
+      - ${CLIENT_CONF:?set CLIENT_CONF to the .conf generated for this machine}:/config/client.conf:ro
+    ports:
+      - "127.0.0.1:${SOCKS_PORT:-1080}:${SOCKS_PORT:-1080}"
+    restart: unless-stopped
