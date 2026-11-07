@@ -9,10 +9,11 @@ transparently onion-routed by a Tor daemon in the server container. Built
 only. `tor` here is the routing daemon: TransPort (transparent), DNSPort and
 SocksPort, all bound to `10.66.66.1`.
 
-## Live state on this machine
+## What a running deployment looks like
 
 - `onionvpn-server` and `onionvpn-client` containers, compose project `onionvpn`,
-  network `onionvpn` pinned to `172.31.66.0/24` (avoids the lab's 172.17-21 etc.).
+  network `onionvpn` pinned via `DOCKER_NET_SUBNET` so it cannot collide with other
+  Docker networks on the host.
 - Published: `0.0.0.0:51820/udp` (WireGuard) and `127.0.0.1:1080` (SOCKS5 into Tor).
 - Tunnel `10.66.66.0/24`; server `.1`, client `docker` `.2`, client `laptop` `.3`.
 - `restart: unless-stopped`, so both come back after a reboot. No systemd units.
@@ -28,7 +29,7 @@ SocksPort, all bound to `10.66.66.1`.
   verdict: `counter accept comment "x"`, never `counter comment "x" accept`.
   The latter is a syntax error. Cost one build cycle.
 - **Don't let the catch-all TCP redirect swallow the gateway's own ports.**
-  `server/onionvpn.nft` returns early for `ip daddr 10.66.66.1`, otherwise
+  `server/onionvpn.nft.template` returns early for `ip daddr 10.66.66.1`, otherwise
   connections to Tor's SocksPort (9050) get redirected to TransPort (9040) and
   SOCKS/`.onion` silently fails while everything else looks fine.
 - **The client kill-switch needs `ct state established,related accept` in its
@@ -112,14 +113,14 @@ different one. Survives `docker compose down` + `onionvpn up`.
   (`::/0` in `AllowedIPs`, no IPv6 on `wg0`, inet drop policy) but it is *untested*. It must be
   checked on a real dual-stack client; the README tells the user how.
 - **Reboot persistence.** `restart: unless-stopped` is standard Docker behaviour but was not
-  tested by rebooting — the user reaches this box over RDP, and restarting the Docker daemon would
-  bounce their other containers. What *was* tested: a crash of Tor (`docker exec ... kill 1`)
+  tested by rebooting, and restarting the Docker daemon would bounce unrelated containers
+  sharing the host. What *was* tested: a crash of Tor (`docker exec ... kill 1`)
   brought the container back by itself, `RestartCount` 1, healthy, Tor re-bootstrapped in seconds.
   Note `docker kill` does **not** trigger a restart — Docker treats it as a manual stop, so don't
   read that as a broken policy.
 - **Throughput and latency.** Never benchmarked. Expect a few Mbit/s and 300ms+; three relays.
 - **`onionvpn uninstall`'s destructive branch.** Only the cancel path was exercised, deliberately:
-  the machine rule is not to remove Docker images the lab may need. The cancel path works.
+  it removes Docker images, and other projects on the host may need them. The cancel path works.
 
 Re-verified 9/9 after the templating refactor, and the refactor itself was proved by
 rendering the server templates with a different `WG_SERVER_IP`: all three Tor listeners
